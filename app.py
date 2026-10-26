@@ -1,12 +1,19 @@
 """
-🌙 퇴근 대시보드 (Streamlit)
+🌙 퇴근 대시보드 (Streamlit) — 여러 사람이 함께 쓰는 버전
 
 실행:  streamlit run app.py
-데이터: data/퇴근기록.csv  (열: 날짜, 출근, 퇴근 / 시간은 HH:MM)
+
+저장 위치
+- Streamlit secrets에 Google Sheets 설정이 있으면 → 구글 스프레드시트에 저장 (모든 사람이 같은 데이터를 봄)
+- 설정이 없으면 → data/퇴근기록.csv 에 저장 (내 컴퓨터에서 혼자 쓸 때)
+
+열: 이름, 날짜(YYYY-MM-DD), 출근(HH:MM), 퇴근(HH:MM), 입력시각
 """
 import datetime as dt
+import re
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,12 +24,16 @@ import streamlit as st
 # 기본 설정
 # ─────────────────────────────────────────────────────────────
 DATA_PATH = Path(__file__).parent / "data" / "퇴근기록.csv"
+SHEET_TAB = "퇴근기록"
+COLS = ["이름", "날짜", "출근", "퇴근", "입력시각"]
+KST = ZoneInfo("Asia/Seoul")
 WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 C = {
     "ink": "#1E2A3B", "sub": "#7A8699", "line": "#E6EAF0",
     "teal": "#2A9D8F", "coral": "#F4845F", "sand": "#E9C46A",
     "plum": "#7B6CF6", "sky": "#8ECAE6", "rose": "#E05A6D", "navy": "#264653",
 }
+PEOPLE_COLORS = ["#7B6CF6", "#2A9D8F", "#F4845F", "#E9C46A", "#264653", "#E05A6D", "#8ECAE6", "#9B5DE5"]
 FONT = "Pretendard, 'Noto Sans KR', 'Malgun Gothic', sans-serif"
 
 st.set_page_config(page_title="퇴근 대시보드", page_icon="🌙", layout="wide")
@@ -36,11 +47,13 @@ html, body, [class*="css"], .stApp, button, input, textarea { font-family: Prete
 .block-container { padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px; }
 section[data-testid="stSidebar"] { background: #1E2A3B; }
 section[data-testid="stSidebar"] * { color: #E8ECF3 !important; }
-section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] textarea { color: #1E2A3B !important; }
+section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] textarea,
+section[data-testid="stSidebar"] [data-baseweb="select"] * { color: #1E2A3B !important; }
 section[data-testid="stSidebar"] .stButton button, section[data-testid="stSidebar"] .stDownloadButton button,
 section[data-testid="stSidebar"] .stFormSubmitButton button {
   background: #F4845F; border: none; color: white !important; font-weight: 700; border-radius: 10px; width: 100%;
 }
+.store { font-size: 12px; padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,.08); }
 .hero { background: linear-gradient(120deg, #1E2A3B 0%, #2B3F5C 55%, #3D3A6B 100%);
   border-radius: 22px; padding: 26px 32px; color: white; margin-bottom: 18px; position: relative; overflow: hidden; }
 .hero:after { content: "🌙"; position: absolute; right: 34px; top: 10px; font-size: 92px; opacity: .18; }
@@ -67,57 +80,100 @@ div[data-testid="stPlotlyChart"] { background: white; border-radius: 18px; borde
 
 
 # ─────────────────────────────────────────────────────────────
-# 데이터 처리
+# 값 정리 (구글 시트에서 사람이 직접 고친 값도 읽을 수 있게)
 # ─────────────────────────────────────────────────────────────
 def to_hhmm(v):
-    """여러 형태의 시간 값을 'HH:MM' 문자열로 통일"""
-    if v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and not v.strip()):
+    """'21:05', '21:05:00', '오후 9:05:00', '9:05 PM', 엑셀 시간 등을 'HH:MM'으로 통일"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
     if isinstance(v, pd.Timestamp):
         v = v.to_pydatetime()
-    if isinstance(v, dt.datetime):
-        return v.strftime("%H:%M")
-    if isinstance(v, dt.time):
+    if isinstance(v, (dt.datetime, dt.time)):
         return v.strftime("%H:%M")
     if isinstance(v, (int, float)):  # 엑셀 시간(하루의 비율)
         m = round(float(v) % 1 * 1440)
         return f"{m // 60:02d}:{m % 60:02d}"
     s = str(v).strip()
-    for fmt in ("%H:%M", "%H:%M:%S", "%H시%M분", "%H%M"):
+    if not s:
+        return None
+    pm = ("오후" in s) or bool(re.search(r"\bpm\b", s, re.I))
+    am = ("오전" in s) or bool(re.search(r"\bam\b", s, re.I))
+    s2 = re.sub(r"(오전|오후|am|pm|AM|PM)", "", s).strip()
+    mt = re.match(r"^(\d{1,2})\s*[:시]\s*(\d{1,2})", s2) or re.match(r"^(\d{2})(\d{2})$", s2)
+    if not mt:
+        return None
+    h, m = int(mt.group(1)), int(mt.group(2))
+    if pm and h < 12:
+        h += 12
+    if am and h == 12:
+        h = 0
+    if h > 23 or m > 59:
+        return None
+    return f"{h:02d}:{m:02d}"
+
+
+def to_date(v):
+    """'2026-09-01', '2026. 9. 1', '2026/9/1', 엑셀 날짜 등을 date로 통일"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, (pd.Timestamp, dt.datetime)):
+        return v.date()
+    if isinstance(v, dt.date):
+        return v
+    s = str(v).strip()
+    mt = re.match(r"^(\d{4})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})", s)
+    if mt:
         try:
-            return dt.datetime.strptime(s, fmt).strftime("%H:%M")
+            return dt.date(int(mt.group(1)), int(mt.group(2)), int(mt.group(3)))
         except ValueError:
-            pass
-    return None
+            return None
+    try:
+        return pd.to_datetime(s).date()
+    except (ValueError, TypeError):
+        return None
 
 
 def norm_col(c) -> str:
-    """'퇴근시간', '출근 시각' 같은 열 이름을 '퇴근', '출근'으로 통일"""
+    """'퇴근시간', '출근 시각', '성명' 같은 열 이름을 표준 이름으로 통일"""
     c = str(c).strip()
-    for key in ("날짜", "출근", "퇴근"):
+    for key in ("날짜", "출근", "퇴근", "입력시각"):
         if c.startswith(key):
             return key
+    if c in ("이름", "성명", "작성자", "name", "Name"):
+        return "이름"
     return c
 
 
-def tidy(df: pd.DataFrame) -> pd.DataFrame:
-    """열 이름 정리 + 형식 통일 + 같은 날짜는 마지막 값만 남김"""
+def tidy(df: pd.DataFrame, default_name: str = "") -> pd.DataFrame:
+    """열 정리 + 형식 통일 + 같은 사람의 같은 날짜는 마지막 값만 남김"""
     df = df.rename(columns=norm_col)
-    if "출근" not in df.columns:
-        df["출근"] = None
-    df = df[["날짜", "출근", "퇴근"]].copy()
-    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce").dt.date
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    for c in COLS:
+        if c not in df.columns:
+            df[c] = None
+    df = df[COLS].copy()
+    df["이름"] = df["이름"].map(lambda x: str(x).strip() if x is not None and not pd.isna(x) else "")
+    df.loc[df["이름"] == "", "이름"] = default_name
+    df["날짜"] = df["날짜"].map(to_date)
     df["출근"] = df["출근"].map(to_hhmm)
     df["퇴근"] = df["퇴근"].map(to_hhmm)
+    df["입력시각"] = df["입력시각"].fillna("").astype(str)
     df = df.dropna(subset=["날짜", "퇴근"])
-    df = df.drop_duplicates("날짜", keep="last").sort_values("날짜").reset_index(drop=True)
+    df = df[df["이름"] != ""]
+    df = (df.drop_duplicates(["이름", "날짜"], keep="last")
+            .sort_values(["날짜", "이름"]).reset_index(drop=True))
     return df
 
 
-def read_any(file) -> pd.DataFrame:
-    """CSV 또는 엑셀(앞서 만든 대시보드 엑셀 포함)에서 날짜·출근·퇴근 표를 찾아 읽기"""
+def to_rows(df: pd.DataFrame) -> list:
+    return [[r["이름"], r["날짜"].strftime("%Y-%m-%d"), r["출근"] or "", r["퇴근"], r["입력시각"] or ""]
+            for _, r in df.iterrows()]
+
+
+def read_any(file, default_name: str) -> pd.DataFrame:
+    """CSV 또는 엑셀(앞서 만든 엑셀 포함)에서 날짜·퇴근 표를 찾아 읽기"""
     if file.name.lower().endswith(".csv"):
-        return tidy(pd.read_csv(file))
+        return tidy(pd.read_csv(file, dtype=str), default_name)
     sheets = pd.read_excel(file, sheet_name=None, header=None)
     for raw in sheets.values():
         for i in range(min(len(raw), 30)):
@@ -125,23 +181,119 @@ def read_any(file) -> pd.DataFrame:
             if "날짜" in row and "퇴근" in row:
                 body = raw.iloc[i + 1:].copy()
                 body.columns = row
-                return tidy(body)
+                return tidy(body, default_name)
     raise ValueError("'날짜'와 '퇴근' 열이 있는 표를 찾지 못했어요.")
 
 
-def load() -> pd.DataFrame:
+def now_kst() -> str:
+    return dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ─────────────────────────────────────────────────────────────
+# 저장소: 구글 시트(공유) 또는 CSV(로컬)
+# ─────────────────────────────────────────────────────────────
+def secret(key, default=None):
+    try:
+        return st.secrets[key] if key in st.secrets else default
+    except Exception:  # secrets 파일이 없을 때
+        return default
+
+
+SHEET_URL = secret("sheet_url")
+SA_INFO = secret("gcp_service_account")
+USE_SHEET = bool(SHEET_URL and SA_INFO)
+ADMIN_PW = secret("admin_password")
+
+
+@st.cache_resource(show_spinner=False)
+def get_ws():
+    import gspread
+    gc = gspread.service_account_from_dict(dict(SA_INFO))
+    sh = gc.open_by_url(SHEET_URL)
+    try:
+        ws = sh.worksheet(SHEET_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_TAB, rows=2000, cols=len(COLS))
+    if not any(ws.row_values(1)):
+        ws.update(values=[COLS], range_name="A1", value_input_option="RAW")
+    return ws
+
+
+def _read_raw() -> pd.DataFrame:
+    if USE_SHEET:
+        vals = get_ws().get_all_values()
+        if len(vals) <= 1:
+            return pd.DataFrame(columns=COLS)
+        width = len(vals[0])
+        return pd.DataFrame([r + [""] * (width - len(r)) for r in vals[1:]], columns=vals[0])
     if DATA_PATH.exists():
-        return tidy(pd.read_csv(DATA_PATH, dtype=str))
-    return pd.DataFrame(columns=["날짜", "출근", "퇴근"])
+        return pd.read_csv(DATA_PATH, dtype=str, keep_default_na=False)
+    return pd.DataFrame(columns=COLS)
 
 
-def save(df: pd.DataFrame):
+@st.cache_data(ttl=20, show_spinner=False)
+def load_records() -> pd.DataFrame:
+    """모든 사람의 기록 (20초마다 새로 읽음)"""
+    return tidy(_read_raw(), "이름없음")
+
+
+def _write_csv(df: pd.DataFrame):
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out = df.copy()
-    out["날짜"] = pd.to_datetime(out["날짜"]).dt.strftime("%Y-%m-%d")
-    out.to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
+    pd.DataFrame(to_rows(df), columns=COLS).to_csv(DATA_PATH, index=False, encoding="utf-8-sig")
 
 
+def upsert(new: pd.DataFrame):
+    """새 기록 저장. 같은 이름+날짜가 있으면 그 줄만 고치고, 없으면 맨 아래에 추가.
+    (다른 사람이 동시에 입력해도 서로의 기록을 덮어쓰지 않도록 전체를 다시 쓰지 않음)"""
+    new = tidy(new)
+    if new.empty:
+        return 0
+    if USE_SHEET:
+        ws = get_ws()
+        vals = ws.get_all_values()
+        hdr = [norm_col(h) for h in (vals[0] if vals else COLS)]
+        ni, di = hdr.index("이름"), hdr.index("날짜")
+        where = {}
+        for i, r in enumerate(vals[1:], start=2):
+            if len(r) > max(ni, di):
+                where[(r[ni].strip(), to_date(r[di]))] = i
+        appends = []
+        for row in to_rows(new):
+            key = (row[0], to_date(row[1]))
+            if key in where:
+                ws.update(values=[row], range_name=f"A{where[key]}:E{where[key]}", value_input_option="RAW")
+            else:
+                appends.append(row)
+        if appends:
+            ws.append_rows(appends, value_input_option="RAW")
+    else:
+        cur = tidy(_read_raw(), "이름없음")
+        _write_csv(tidy(pd.concat([cur, new], ignore_index=True)))
+    load_records.clear()
+    return len(new)
+
+
+def apply_edits(original: pd.DataFrame, edited: pd.DataFrame):
+    """표에서 고친 내용 반영: 지운 줄은 지우고 고친 줄은 덮어씀.
+    저장 직전에 최신 데이터를 다시 읽어서, 그 사이 다른 사람이 넣은 기록은 그대로 둠."""
+    edited = tidy(edited)
+    key = lambda df: set(zip(df["이름"], df["날짜"]))
+    removed = key(original) - key(edited)
+    latest = tidy(_read_raw(), "이름없음")
+    latest = latest[[k not in removed for k in zip(latest["이름"], latest["날짜"])]]
+    result = tidy(pd.concat([latest, edited], ignore_index=True))
+    if USE_SHEET:
+        ws = get_ws()
+        ws.clear()
+        ws.update(values=[COLS] + to_rows(result), range_name="A1", value_input_option="RAW")
+    else:
+        _write_csv(result)
+    load_records.clear()
+
+
+# ─────────────────────────────────────────────────────────────
+# 계산
+# ─────────────────────────────────────────────────────────────
 def mins(hhmm: str) -> int:
     h, m = hhmm.split(":")
     return int(h) * 60 + int(m)
@@ -170,26 +322,40 @@ def compute(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
 
 
 def to_excel(d: pd.DataFrame) -> bytes:
-    out = d[["날짜", "요일", "출근", "퇴근", "근무", "야근"]].copy()
-    out.columns = ["날짜", "요일", "출근", "퇴근", "근무시간(h)", "야근시간(h)"]
+    out = d[["이름", "날짜", "요일", "출근", "퇴근", "근무", "야근"]].copy()
+    out.columns = ["이름", "날짜", "요일", "출근", "퇴근", "근무시간(h)", "야근시간(h)"]
     out[["근무시간(h)", "야근시간(h)"]] = out[["근무시간(h)", "야근시간(h)"]].round(2)
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         out.to_excel(xw, index=False, sheet_name="퇴근기록")
         ws = xw.sheets["퇴근기록"]
-        for col, w in zip("ABCDEF", [13, 6, 8, 8, 12, 12]):
+        for col, w in zip("ABCDEFG", [10, 13, 6, 8, 8, 12, 12]):
             ws.column_dimensions[col].width = w
     return buf.getvalue()
 
 
 # ─────────────────────────────────────────────────────────────
-# 상태 & 사이드바
+# 사이드바: 입력
 # ─────────────────────────────────────────────────────────────
-if "df" not in st.session_state:
-    st.session_state.df = load()
+try:
+    records = load_records()
+    load_error = None
+except Exception as ex:  # noqa: BLE001
+    records, load_error = pd.DataFrame(columns=COLS), ex
+
+names = sorted(records["이름"].unique().tolist())
+
+if "my_name" not in st.session_state:
+    st.session_state.my_name = st.query_params.get("name", "")
 
 with st.sidebar:
     st.markdown("## 🌙 퇴근 기록")
+    if USE_SHEET:
+        st.markdown('<div class="store">☁️ 구글 시트에 저장 중 · 모든 사람이 같은 기록을 봐요</div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="store">💾 이 컴퓨터의 CSV 파일에 저장 중 (혼자 쓰는 모드)</div>',
+                    unsafe_allow_html=True)
 
     with st.expander("⚙️ 기준 설정", expanded=False):
         start_t = st.time_input("기본 출근", dt.time(9, 30), step=600)
@@ -199,46 +365,72 @@ with st.sidebar:
     cfg = {"start": start_t.strftime("%H:%M"), "lunch": lunch, "regular": regular,
            "late": late_t.hour * 60 + late_t.minute}
 
-    st.markdown("### ➕ 오늘 기록 추가")
+    st.markdown("### ➕ 기록 추가")
     with st.form("add", clear_on_submit=False):
-        day = st.date_input("날짜", dt.date.today())
+        my_name = st.text_input("이름", key="my_name", placeholder="예: 김세연",
+                                help="같은 이름으로 입력한 기록끼리 모여요.")
+        day = st.date_input("날짜", dt.datetime.now(KST).date())
         c1, c2 = st.columns(2)
         in_t = c1.time_input("출근", start_t, step=300)
         out_t = c2.time_input("퇴근", dt.time(21, 0), step=300)
-        if st.form_submit_button("저장하기"):
-            new = pd.DataFrame([{"날짜": day, "출근": in_t.strftime("%H:%M"), "퇴근": out_t.strftime("%H:%M")}])
-            st.session_state.df = tidy(pd.concat([st.session_state.df, new], ignore_index=True))
-            save(st.session_state.df)
-            st.toast(f"{day:%m/%d} 퇴근 {out_t:%H:%M} 저장했어요 ✅")
+        submitted = st.form_submit_button("저장하기")
+    if submitted:
+        if not my_name.strip():
+            st.error("이름을 입력해 주세요.")
+        else:
+            try:
+                upsert(pd.DataFrame([{"이름": my_name.strip(), "날짜": day, "출근": in_t.strftime("%H:%M"),
+                                      "퇴근": out_t.strftime("%H:%M"), "입력시각": now_kst()}]))
+                st.session_state.view = my_name.strip()
+                st.toast(f"{my_name.strip()} · {day:%m/%d} 퇴근 {out_t:%H:%M} 저장했어요 ✅")
+                st.rerun()
+            except Exception as ex:  # noqa: BLE001
+                st.error(f"저장하지 못했어요: {ex}")
+
+    st.markdown("### 👀 보기")
+    options = ["전체"] + names
+    if st.session_state.get("view") not in options:
+        st.session_state.view = names[0] if len(names) == 1 else "전체"
+    view = st.selectbox("누구의 기록을 볼까요?", options, key="view")
+    if st.button("🔄 최신 기록 불러오기"):
+        load_records.clear()
+        st.rerun()
 
     st.markdown("### 📂 데이터")
     up = st.file_uploader("엑셀/CSV 불러오기", type=["xlsx", "csv"],
-                          help="'날짜', '퇴근' 열이 있으면 됩니다. '출근'은 없어도 돼요.")
+                          help="'날짜', '퇴근' 열이 있으면 됩니다. '이름' 열이 없으면 위에 입력한 이름으로 저장돼요.")
     if up is not None and st.session_state.get("_uploaded") != up.file_id:
         try:
-            loaded = read_any(up)
-            mode = st.radio("불러온 데이터를", ["기존 기록에 합치기", "기존 기록 대신 쓰기"], key="mode")
-            if st.button("적용"):
-                base = st.session_state.df if mode.startswith("기존 기록에") else loaded.iloc[0:0]
-                st.session_state.df = tidy(pd.concat([base, loaded], ignore_index=True))
-                save(st.session_state.df)
-                st.session_state._uploaded = up.file_id
-                st.rerun()
-            st.caption(f"{len(loaded)}일치 기록을 찾았어요.")
+            loaded = read_any(up, (st.session_state.my_name or "").strip())
+            if loaded.empty:
+                st.warning("이름을 먼저 입력하거나, 파일에 '이름' 열을 넣어 주세요.")
+            else:
+                st.caption(f"{loaded['이름'].nunique()}명 · {len(loaded)}건을 찾았어요. "
+                           "같은 이름·날짜는 새 값으로 바뀌어요.")
+                if st.button("기록에 추가하기"):
+                    loaded["입력시각"] = now_kst()
+                    upsert(loaded)
+                    st.session_state._uploaded = up.file_id
+                    st.rerun()
         except Exception as ex:  # noqa: BLE001
             st.error(str(ex))
 
-df_raw = st.session_state.df
-if df_raw.empty:
-    st.info("왼쪽에서 첫 퇴근 기록을 추가하거나 엑셀 파일을 불러오세요.")
+if load_error is not None:
+    st.error(f"기록을 불러오지 못했어요. 구글 시트 설정(secrets)과 공유 권한을 확인해 주세요.\n\n{load_error}")
     st.stop()
 
-d = compute(df_raw, cfg)
+if records.empty:
+    st.info("아직 기록이 없어요. 왼쪽에서 이름과 퇴근시간을 넣고 저장해 보세요.")
+    st.stop()
+
+all_d = compute(records, cfg)
+d = all_d if view == "전체" else all_d[all_d["이름"] == view].reset_index(drop=True)
+team_view = view == "전체" and all_d["이름"].nunique() > 1
 
 with st.sidebar:
-    st.download_button("⬇️ 엑셀로 내려받기", to_excel(d), file_name="퇴근기록.xlsx",
+    st.download_button("⬇️ 엑셀로 내려받기", to_excel(d), file_name=f"퇴근기록_{view}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.caption(f"기록 {len(d)}일 · {d['날짜'].min():%Y.%m.%d} ~ {d['날짜'].max():%Y.%m.%d}")
+    st.caption(f"{view} · {len(d)}건 · {d['날짜'].min():%Y.%m.%d} ~ {d['날짜'].max():%Y.%m.%d}")
 
 # ─────────────────────────────────────────────────────────────
 # 지표 계산
@@ -274,11 +466,13 @@ if len(months) > 1:
 # ─────────────────────────────────────────────────────────────
 # 헤더 & KPI
 # ─────────────────────────────────────────────────────────────
+who = f"{all_d['이름'].nunique()}명 전체" if view == "전체" else view
+badge = "우리 팀 퇴근 칭호" if team_view else f"{view}님의 퇴근 칭호"
 st.markdown(
     f"""<div class="hero"><h1>퇴근 대시보드</h1>
-<p>{d['날짜'].min():%Y.%m.%d} – {d['날짜'].max():%Y.%m.%d} · 근무일 {n}일 ·
+<p>{who} · {d['날짜'].min():%Y.%m.%d} – {d['날짜'].max():%Y.%m.%d} · 기록 {n}건 ·
 정시퇴근 기준 {hhmm(mins(cfg['start']) + (cfg['regular'] + cfg['lunch']) * 60)}</p>
-<div class="badge">나의 퇴근 칭호: {title}</div></div>""",
+<div class="badge">{badge}: {title}</div></div>""",
     unsafe_allow_html=True,
 )
 
@@ -293,12 +487,15 @@ def kpi(col, label, value, unit, sub, color, icon):
 
 
 k = st.columns(6)
-kpi(k[0], "근무일수", n, "일", f"칼퇴 {kal}일", C["navy"], "📅")
-kpi(k[1], "총 근무시간", f"{tot_work:,.1f}", "h", f"하루 평균 {tot_work / n:.1f}h", C["teal"], "💼")
-kpi(k[2], "총 야근시간", f"{tot_ot:,.1f}", "h", f"하루 평균 {tot_ot / n * 60:.0f}분{delta_txt}", C["coral"], "🔥")
+if team_view:
+    kpi(k[0], "참여 인원", all_d["이름"].nunique(), "명", f"기록 {n}건 · 칼퇴 {kal}건", C["navy"], "👥")
+else:
+    kpi(k[0], "근무일수", n, "일", f"칼퇴 {kal}일", C["navy"], "📅")
+kpi(k[1], "총 근무시간", f"{tot_work:,.1f}", "h", f"1건 평균 {tot_work / n:.1f}h", C["teal"], "💼")
+kpi(k[2], "총 야근시간", f"{tot_ot:,.1f}", "h", f"1건 평균 {tot_ot / n * 60:.0f}분{delta_txt}", C["coral"], "🔥")
 kpi(k[3], "평균 퇴근", hhmm(avg_out), "", f"{late_t:%H:%M} 이후 퇴근 {late_ratio:.0%}", C["plum"], "🕘")
 kpi(k[4], "가장 늦은 퇴근", hhmm(latest['퇴근분']), "",
-    f"{latest['날짜']:%m/%d} ({latest['요일']})", C["rose"], "🌃")
+    f"{latest['날짜']:%m/%d} ({latest['요일']})" + (f" · {latest['이름']}" if team_view else ""), C["rose"], "🌃")
 kpi(k[5], "야근을 영화로", f"{movies:.0f}", "편", "2시간짜리 영화 기준", "#C08B1E", "🎬")
 
 
@@ -330,6 +527,38 @@ def time_axis(lo, hi, step=30):
 
 lo_out = max(0, (d["퇴근분"].min() // 30) * 30 - 30)
 hi_out = (d["퇴근분"].max() // 30) * 30 + 60
+person_color = {nm: PEOPLE_COLORS[i % len(PEOPLE_COLORS)] for i, nm in enumerate(sorted(all_d["이름"].unique()))}
+
+# ─────────────────────────────────────────────────────────────
+# 사람별 비교 (전체 보기 + 2명 이상일 때)
+# ─────────────────────────────────────────────────────────────
+if team_view:
+    st.markdown('<div class="sec">👥 사람별 비교</div>', unsafe_allow_html=True)
+    p = (d.groupby("이름").agg(건수=("날짜", "count"), 평균야근=("야근", "mean"), 평균퇴근=("퇴근분", "mean"),
+                              늦은퇴근=("늦은퇴근", "mean"))
+         .sort_values("평균야근", ascending=False).reset_index())
+    c1, c2 = st.columns([1.3, 1])
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_bar(x=p["이름"], y=p["평균야근"] * 60, name="하루 평균 야근(분)",
+                marker_color=[person_color[x] for x in p["이름"]],
+                text=(p["평균야근"] * 60).map(lambda v: f"{v:.0f}분"), textposition="outside",
+                customdata=p["건수"], hovertemplate="%{x} · %{customdata}건<br>평균 야근 %{y:.0f}분<extra></extra>")
+    fig.add_scatter(x=p["이름"], y=p["평균퇴근"], name="평균 퇴근", mode="markers",
+                    marker=dict(size=14, symbol="diamond", color=C["ink"], line=dict(color="white", width=2)),
+                    secondary_y=True, customdata=p["평균퇴근"].map(hhmm),
+                    hovertemplate="%{x} 평균 퇴근 %{customdata}<extra></extra>")
+    fig.update_yaxes(title_text="하루 평균 야근(분)", secondary_y=False, range=[0, max(p["평균야근"].max() * 60, 1) * 1.3])
+    fig.update_yaxes(secondary_y=True, showgrid=False, **time_axis(lo_out, hi_out, 60))
+    with c1:
+        show(base(fig, "사람별 하루 평균 야근 & 평균 퇴근"))
+    fig = go.Figure(go.Bar(y=p["이름"], x=p["늦은퇴근"], orientation="h",
+                           marker_color=[person_color[x] for x in p["이름"]],
+                           text=p["늦은퇴근"].map(lambda v: f"{v:.0%}"), textposition="outside",
+                           hovertemplate="%{y} · %{x:.0%}<extra></extra>"))
+    fig.update_xaxes(tickformat=".0%", range=[0, 1.15], gridcolor="#F0F2F6", showgrid=True)
+    fig.update_yaxes(autorange="reversed")
+    with c2:
+        show(base(fig, f"{late_t:%H:%M} 이후 퇴근 비율"))
 
 # ─────────────────────────────────────────────────────────────
 # 1행: 월별 · 요일별
@@ -346,15 +575,16 @@ fig.add_bar(x=m["라벨"], y=m["근무"] - m["야근"], name="정규 근무", ma
 fig.add_bar(x=m["라벨"], y=m["야근"], name="야근", marker_color=C["coral"],
             text=m["근무"].map(lambda v: f"총 {v:.0f}h"), textposition="outside",
             hovertemplate="%{x} 야근 %{y:.1f}h<extra></extra>")
-fig.add_scatter(x=m["라벨"], y=m["야근일"], name="야근 일수", mode="lines+markers+text",
-                line=dict(color=C["plum"], width=3), marker=dict(size=10),
-                text=m["야근일"].map(lambda v: f"{v}일"), textposition="top center",
-                secondary_y=True, hovertemplate="%{x} 야근 %{y}일<extra></extra>")
+fig.add_scatter(x=m["라벨"], y=m["야근일"], name="야근 일수" if not team_view else "야근 건수",
+                mode="lines+markers+text", line=dict(color=C["plum"], width=3), marker=dict(size=10),
+                text=m["야근일"].map(lambda v: f"{v}{'건' if team_view else '일'}"), textposition="top center",
+                secondary_y=True, hovertemplate="%{x} 야근 %{y}<extra></extra>")
 fig.update_layout(barmode="stack")
 fig.update_yaxes(title_text="근무시간(h)", secondary_y=False, range=[0, m["근무"].max() * 1.25])
-fig.update_yaxes(title_text="야근 일수", secondary_y=True, showgrid=False, range=[0, m["야근일"].max() * 1.5])
+fig.update_yaxes(title_text="야근 일수" if not team_view else "야근 건수", secondary_y=True, showgrid=False,
+                 range=[0, max(m["야근일"].max(), 1) * 1.5])
 with c1:
-    show(base(fig, "월별 근무시간 & 야근 일수"))
+    show(base(fig, "월별 근무시간 & 야근 " + ("건수" if team_view else "일수")))
 
 w = (d.groupby("요일").agg(야근=("야근", "sum"), 평균퇴근=("퇴근분", "mean"), 일수=("날짜", "count"))
      .reindex([x for x in WEEKDAYS if x in set(d["요일"])]).reset_index())
@@ -367,7 +597,7 @@ fig.add_scatter(x=w["요일"], y=w["평균퇴근"], name="평균 퇴근", mode="
                 line=dict(color=C["plum"], width=3, shape="spline"), marker=dict(size=10, symbol="diamond"),
                 secondary_y=True, customdata=w["평균퇴근"].map(hhmm),
                 hovertemplate="%{x}요일 평균 퇴근 %{customdata}<extra></extra>")
-fig.update_yaxes(title_text="야근시간(h)", secondary_y=False, range=[0, w["야근"].max() * 1.3])
+fig.update_yaxes(title_text="야근시간(h)", secondary_y=False, range=[0, max(w["야근"].max(), 0.1) * 1.3])
 fig.update_yaxes(secondary_y=True, showgrid=False, **time_axis(lo_out, hi_out, 60))
 with c2:
     show(base(fig, "요일별 야근시간 & 평균 퇴근시각"))
@@ -375,6 +605,7 @@ with c2:
 # ─────────────────────────────────────────────────────────────
 # 2행: 시간대 분포 · 도넛 · 원형
 # ─────────────────────────────────────────────────────────────
+unit = "건" if team_view else "일"
 st.markdown('<div class="sec">🍩 퇴근 패턴</div>', unsafe_allow_html=True)
 c1, c2, c3 = st.columns([1.4, 1, 1])
 
@@ -384,9 +615,9 @@ cnt = pd.cut(d["퇴근분"], bins=edges, right=False, labels=labels).value_count
 grad = ["#B8E0D2", "#8ECAE6", "#2A9D8F", "#E9C46A", "#F4A261", "#F4845F", "#E05A6D", "#9B2C4B"]
 fig = go.Figure(go.Bar(x=cnt.index, y=cnt.values,
                        marker_color=[grad[min(i, len(grad) - 1)] for i in range(len(cnt))],
-                       text=[f"{int(v)}일" if v else "" for v in cnt.values], textposition="outside",
-                       hovertemplate="%{x}<br>%{y}일<extra></extra>"))
-fig.update_yaxes(range=[0, max(cnt.max(), 1) * 1.3], title_text="일수")
+                       text=[f"{int(v)}{unit}" if v else "" for v in cnt.values], textposition="outside",
+                       hovertemplate="%{x}<br>%{y}" + unit + "<extra></extra>"))
+fig.update_yaxes(range=[0, max(cnt.max(), 1) * 1.3], title_text=f"{unit}수")
 with c1:
     show(base(fig, "퇴근 시간대 분포 (30분 단위)"))
 
@@ -402,8 +633,8 @@ with c2:
 late_n = int(d["늦은퇴근"].sum())
 fig = go.Figure(go.Pie(labels=[f"{late_t:%H:%M} 이전", f"{late_t:%H:%M} 이후"], values=[n - late_n, late_n],
                        marker=dict(colors=[C["sky"], C["rose"]], line=dict(color="white", width=3)),
-                       textinfo="percent+value", texttemplate="%{percent}<br>%{value}일", sort=False,
-                       pull=[0, 0.06], hovertemplate="%{label} 퇴근 %{value}일<extra></extra>"))
+                       textinfo="percent+value", texttemplate="%{percent}<br>%{value}" + unit, sort=False,
+                       pull=[0, 0.06], hovertemplate="%{label} 퇴근 %{value}" + unit + "<extra></extra>"))
 with c3:
     show(base(fig, "늦은 퇴근 비율"))
 
@@ -417,18 +648,28 @@ fig.add_hrect(y0=cfg["late"], y1=hi_out, fillcolor=C["rose"], opacity=0.06, line
 fig.add_hline(y=cfg["late"], line=dict(color=C["rose"], dash="dot"),
               annotation_text=f"늦은 퇴근 {late_t:%H:%M}", annotation_position="top left",
               annotation_font_color=C["rose"])
-fig.add_scatter(x=pd.to_datetime(d["날짜"]), y=d["퇴근분"], mode="lines+markers", name="퇴근",
-                line=dict(color=C["plum"], width=2.5, shape="spline", smoothing=0.6),
-                marker=dict(size=8, color=[C["rose"] if x else C["plum"] for x in d["늦은퇴근"]],
-                            line=dict(color="white", width=1.5)),
-                customdata=d[["퇴근", "요일"]],
-                hovertemplate="%{x|%m/%d} (%{customdata[1]})<br>퇴근 %{customdata[0]}<extra></extra>")
-roll = d["퇴근분"].rolling(5, min_periods=1).mean()
-fig.add_scatter(x=pd.to_datetime(d["날짜"]), y=roll, mode="lines", name="5일 평균",
-                line=dict(color=C["sand"], width=3), hoverinfo="skip")
+if team_view:  # 사람마다 선 하나씩
+    for nm, g in d.groupby("이름"):
+        fig.add_scatter(x=pd.to_datetime(g["날짜"]), y=g["퇴근분"], mode="lines+markers", name=nm,
+                        line=dict(color=person_color[nm], width=2.2, shape="spline", smoothing=0.6),
+                        marker=dict(size=7, line=dict(color="white", width=1.2)),
+                        customdata=g[["퇴근", "요일"]],
+                        hovertemplate=nm + " · %{x|%m/%d} (%{customdata[1]})<br>퇴근 %{customdata[0]}<extra></extra>")
+    chart_title = "사람별 매일 퇴근시각"
+else:
+    fig.add_scatter(x=pd.to_datetime(d["날짜"]), y=d["퇴근분"], mode="lines+markers", name="퇴근",
+                    line=dict(color=C["plum"], width=2.5, shape="spline", smoothing=0.6),
+                    marker=dict(size=8, color=[C["rose"] if x else C["plum"] for x in d["늦은퇴근"]],
+                                line=dict(color="white", width=1.5)),
+                    customdata=d[["퇴근", "요일"]],
+                    hovertemplate="%{x|%m/%d} (%{customdata[1]})<br>퇴근 %{customdata[0]}<extra></extra>")
+    roll = d["퇴근분"].rolling(5, min_periods=1).mean()
+    fig.add_scatter(x=pd.to_datetime(d["날짜"]), y=roll, mode="lines", name="5일 평균",
+                    line=dict(color=C["sand"], width=3), hoverinfo="skip")
+    chart_title = "매일 퇴근시각 (빨간 점 = 늦은 퇴근)"
 fig.update_yaxes(**time_axis(lo_out, hi_out, 30))
 fig.update_xaxes(tickformat="%m/%d")
-show(base(fig, "매일 퇴근시각 (빨간 점 = 늦은 퇴근)", h=330))
+show(base(fig, chart_title, h=330))
 
 c1, c2 = st.columns([1, 1.15])
 wk = d.groupby("주").agg(야근=("야근", "sum"), 일수=("날짜", "count")).reset_index()
@@ -437,14 +678,14 @@ fig = go.Figure(go.Bar(x=wk["라벨"], y=wk["야근"],
                        marker=dict(color=wk["야근"], colorscale=[[0, "#C9C2FF"], [1, C["plum"]]]),
                        text=wk["야근"].map(lambda v: f"{v:.1f}"), textposition="outside",
                        customdata=wk["일수"],
-                       hovertemplate="%{x} · %{customdata}일<br>야근 %{y:.1f}h<extra></extra>"))
-fig.update_yaxes(title_text="야근시간(h)", range=[0, wk["야근"].max() * 1.25])
+                       hovertemplate="%{x} · %{customdata}" + unit + "<br>야근 %{y:.1f}h<extra></extra>"))
+fig.update_yaxes(title_text="야근시간(h)", range=[0, max(wk["야근"].max(), 0.1) * 1.25])
 with c1:
     show(base(fig, "주별 야근시간"))
 
 days_shown = [x for x in WEEKDAYS if x in set(d["요일"])]
 piv = d.pivot_table(index="요일", columns="주", values="퇴근분", aggfunc="mean").reindex(days_shown)
-txt = d.pivot_table(index="요일", columns="주", values="퇴근", aggfunc="first").reindex(days_shown)
+txt = piv.apply(lambda col: col.map(lambda v: hhmm(v) if pd.notna(v) else ""))
 fig = go.Figure(go.Heatmap(
     z=piv.values, x=[f"{c:%m/%d}" for c in piv.columns], y=piv.index,
     text=txt.values, texttemplate="%{text}", textfont=dict(size=10),
@@ -454,27 +695,39 @@ fig = go.Figure(go.Heatmap(
 fig.update_yaxes(autorange="reversed", showgrid=False)
 fig.update_xaxes(title_text="주 시작일(월)", side="bottom")
 with c2:
-    show(base(fig, "퇴근 캘린더 (진할수록 늦게 퇴근)"))
+    show(base(fig, "퇴근 캘린더 (진할수록 늦게 퇴근" + (", 평균)" if team_view else ")")))
 
 # ─────────────────────────────────────────────────────────────
 # 기록 보기 · 수정
 # ─────────────────────────────────────────────────────────────
-st.markdown('<div class="sec">📋 기록 보기 · 수정 <span>표에서 바로 고치거나 행을 지울 수 있어요</span></div>',
+st.markdown('<div class="sec">📋 기록 보기 · 수정 <span>표에서 고치거나 행을 지운 뒤 저장하세요</span></div>',
             unsafe_allow_html=True)
 with st.expander("기록 표 열기", expanded=False):
-    edit = df_raw.copy()
+    base_df = records if view == "전체" else records[records["이름"] == view].reset_index(drop=True)
+    unlocked = True
+    if ADMIN_PW:
+        pw = st.text_input("수정·삭제는 관리자 비밀번호가 필요해요", type="password", key="pw")
+        unlocked = pw == ADMIN_PW
+        if pw and not unlocked:
+            st.error("비밀번호가 맞지 않아요.")
+    edit = base_df[["이름", "날짜", "출근", "퇴근", "입력시각"]].copy()
     edit["날짜"] = pd.to_datetime(edit["날짜"])
     edited = st.data_editor(
-        edit, num_rows="dynamic", hide_index=True, width="stretch",
+        edit, num_rows="dynamic" if unlocked else "fixed", disabled=not unlocked,
+        hide_index=True, width="stretch",
         column_config={
+            "이름": st.column_config.TextColumn("이름", required=True),
             "날짜": st.column_config.DateColumn("날짜", format="YYYY-MM-DD", required=True),
             "출근": st.column_config.TextColumn("출근 (HH:MM)", help="비우면 기본 출근시각 사용"),
             "퇴근": st.column_config.TextColumn("퇴근 (HH:MM)", required=True),
+            "입력시각": st.column_config.TextColumn("입력시각", disabled=True),
         },
         key="editor",
     )
-    if st.button("수정 내용 저장"):
-        st.session_state.df = tidy(edited)
-        save(st.session_state.df)
-        st.success("저장했어요.")
-        st.rerun()
+    if unlocked and st.button("수정 내용 저장"):
+        try:
+            apply_edits(base_df, edited)
+            st.success("저장했어요. 다른 사람 화면에도 곧 반영돼요.")
+            st.rerun()
+        except Exception as ex:  # noqa: BLE001
+            st.error(f"저장하지 못했어요: {ex}")
